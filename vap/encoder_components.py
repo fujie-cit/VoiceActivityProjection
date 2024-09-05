@@ -96,6 +96,7 @@ class CPCEncoder(nn.Module):
         return self.conv4.out_channels
 
     def forward(self, x):
+        input_x = x
         x = F.relu(self.batchNorm0(self.conv0(x)))
         x = F.relu(self.batchNorm1(self.conv1(x)))
         x = F.relu(self.batchNorm2(self.conv2(x)))
@@ -137,7 +138,7 @@ class CPCAR(nn.Module):
     def getDimOutput(self):
         return self.baseNet.hidden_size
 
-    def forward(self, x):
+    def forward(self, x, external_hidden=None):
 
         if self.reverse:
             x = torch.flip(x, [1])
@@ -145,7 +146,12 @@ class CPCAR(nn.Module):
             self.baseNet.flatten_parameters()
         except RuntimeError:
             pass
-        x, h = self.baseNet(x, self.hidden)
+
+        if external_hidden is not None:
+            x, h = self.baseNet(x, external_hidden)
+        else:
+            x, h = self.baseNet(x, self.hidden)
+            
         if self.keepHidden:
             if isinstance(h, tuple):
                 self.hidden = tuple(x.detach() for x in h)
@@ -156,7 +162,7 @@ class CPCAR(nn.Module):
         # by each module
         if self.reverse:
             x = torch.flip(x, [1])
-        return x
+        return x, h
 
 
 class CPCModel(nn.Module):

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 
 def ffn_block(
@@ -76,7 +76,12 @@ class MultiHeadAttention(nn.Module):
             mask = MultiHeadAttention.prepare_causal_mask(
                 T, device=qk.device, dtype=qk.dtype
             )
-        qk = qk.masked_fill(mask == 0, float("-inf"))
+        # QのサイズがKのサイズより小さい場合は，maskをスライスして適用
+        if mask.shape(-2) > qk.size(-2):
+            submask = mask[:, :, -qk.size(-2):, :]
+            qk = qk.masked_fill(submask == 0, float("-inf"))
+        else:
+            qk = qk.masked_fill(mask == 0, float("-inf"))
         return qk
 
     def forward(
@@ -85,6 +90,7 @@ class MultiHeadAttention(nn.Module):
         K: torch.Tensor,
         V: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        context: Optional[Dict[str, Any]] = None,
     ):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, D = Q.size()
@@ -93,6 +99,22 @@ class MultiHeadAttention(nn.Module):
         k = self.unstack_heads(self.key(K))  # (B, heads, T, D_head)
         q = self.unstack_heads(self.query(Q))  # (B, heads, T, D_head)
         v = self.unstack_heads(self.value(V))  # (B, heads, T, D_head)
+
+        # contextが与えられている場合の処理
+        max_cache_size = 1000 # TODO: パラメタ化
+        if context is not None:
+            if "k" not in context:
+                context["k"] = torch.zeros(B, self.num_heads, 0, D//self.num_heads, device=Q.device)
+                context["v"] = torch.zeros(B, self.num_heads, 0, D//self.num_heads, device=Q.device)
+            # キャッシュと新しい値の連結
+            k = torch.cat((context["k"], k), dim=2)
+            v = torch.cat((context["v"], v), dim=2)
+            # 古い値の削除
+            k = k[:, :, -max_cache_size:, :]
+            v = v[:, :, -max_cache_size:, :]
+            # contextの更新
+            context["k"] = k
+            context["v"] = v
 
         # QK
         att = self.get_scores(q, k) * self.scale  #  (B, nh, T, T)
@@ -107,7 +129,7 @@ class MultiHeadAttention(nn.Module):
 
         # output projection
         y = self.resid_drop(self.proj(y))
-        return y, att
+        return y, att, context
 
 
 class MultiHeadAttentionAlibi(MultiHeadAttention):
@@ -195,10 +217,17 @@ class MultiHeadAttentionAlibi(MultiHeadAttention):
             else:
                 mask = self.mask[..., :T, :T]
 
-        # add aLiBi-mask to qk (see Figure 3.)
-        # Addition/translation does not effect softmax (over each row)
-        # mentioned in the original representation
-        qk = qk + mask.to(qk.device)
+        # # add aLiBi-mask to qk (see Figure 3.)
+        # # Addition/translation does not effect softmax (over each row)
+        # # mentioned in the original representation
+        # qk = qk + mask.to(qk.device)
+        if qk.size(-2) < T:
+            submask = mask[..., -qk.size(-2):, :]
+            qk = qk + submask.to(qk.device)
+
+        else:
+            qk = qk + mask.to(qk.device)
+
         return qk
 
 
@@ -248,14 +277,26 @@ class TransformerLayer(nn.Module):
         x: torch.Tensor,
         src: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Using pre-layer-normalization: https://arxiv.org/pdf/2002.04745.pdf
         """
 
+        if context is not None:
+            if "mha" not in context:
+                context["mha"] = {}
+            if "mha_cross" not in context:
+                context["mha_cross"] = {}
+
         # Self-attention
         z = self.ln_self_attn(x)
-        self_attn, self_attn_weights = self.mha(Q=z, K=z, V=z, mask=mask)
+        # contextが与えられている場合は利用して計算
+        context_mha = context["mha"] if context is not None else None
+        self_attn, self_attn_weights, context_mha  = self.mha(Q=z, K=z, V=z, mask=mask, context=context_mha)
+        # contextの更新
+        if context is not None:
+            context["mha"] = context_mha
 
         # Residual
         x = x + self.dropout(self_attn)
@@ -264,15 +305,22 @@ class TransformerLayer(nn.Module):
         cross_attn_weights = None
         if self.cross_attention and src is not None:
             z = self.ln_src_attn(x)
+
+            # contextが与えられている場合は利用して計算
+            context_mha_cross = context["mha_cross"] if context is not None else None
             # https://nn.labml.ai/transformers/models.html#section-16
             # Don't normalize src... why?
-            cross_attn, cross_attn_weights = self.mha_cross(
-                Q=z, K=src, V=src, mask=mask
+            cross_attn, cross_attn_weights, context_mha_cross = self.mha_cross(
+                Q=z, K=src, V=src, mask=mask, context=context_mha_cross
             )
+            # contextの更新            
+            if context is not None:
+                context["mha_cross"] = context_mha_cross
+
             x = x + self.dropout(cross_attn)
 
         x = x + self.dropout(self.ffnetwork(self.ln_ffnetwork(x)))
-        return x, self_attn_weights, cross_attn_weights
+        return x, self_attn_weights, cross_attn_weights, context
 
 
 class TransformerStereoLayer(TransformerLayer):
@@ -281,12 +329,27 @@ class TransformerStereoLayer(TransformerLayer):
         x1: torch.Tensor,
         x2: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        context: Optional[Dict[str, Any]] = None,
     ):
+        if context is not None:
+            if "x1" not in context:
+                context["x1"] = {}
+            if "x2" not in context:
+                context["x2"] = {}
+        
         # sa1w: self-attention-weights 1
         # ca1w: cross-attention-weights 1
-        z1, sa1w, ca1w = super().forward(x=x1, src=x2, mask=mask)
-        z2, sa2w, ca2w = super().forward(x=x2, src=x1, mask=mask)
-        return z1, z2, [sa1w, ca1w, sa2w, ca2w]
+        context_x1 = context["x1"] if context is not None else None
+        z1, sa1w, ca1w, context_x1 = super().forward(x=x1, src=x2, mask=mask, context=context_x1)
+        
+        context_x2 = context["x2"] if context is not None else None
+        z2, sa2w, ca2w, context_x2 = super().forward(x=x2, src=x1, mask=mask, context=context_x2)
+
+        if context is not None:
+            context["x1"] = context_x1
+            context["x2"] = context_x2
+
+        return z1, z2, [sa1w, ca1w, sa2w, ca2w], context
 
 
 class GPT(nn.Module):
@@ -340,12 +403,25 @@ class GPT(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     def forward(
-        self, x: torch.Tensor, attention: bool = False
+        self, x: torch.Tensor, attention: bool = False, context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, torch.Tensor]:
         all_attention = []
 
-        for layer in self.layers:
-            x, self_attn_weights, _ = layer(x)
+        # contextが与えられた場合は必要に応じて初期化
+        if context is not None:
+            if "layers" not in context:
+                context["layers"] = []
+                for _ in range(self.num_layers):
+                    context["layers"].append({})
+
+        for i, layer in enumerate(self.layers):
+            # contextが与えられている場合は利用して計算
+            c = context["layers"][i] if context is not None else None
+            x, self_attn_weights, _, c = layer(x, context=c)
+            # contextが与えられている場合は更新
+            if context is not None:
+                context["layers"][i] = c
+            
             if attention:
                 all_attention.append(self_attn_weights)
 
@@ -355,7 +431,7 @@ class GPT(nn.Module):
             self_attn_weights = torch.stack(all_attention, dim=1)
             ret["attn"] = self_attn_weights
 
-        return ret
+        return ret, context
 
 
 class GPTStereo(GPT):
@@ -378,15 +454,29 @@ class GPTStereo(GPT):
         self.combinator = Combinator(dim=self.dim, activation="GELU")
 
     def forward(
-        self, x1: torch.Tensor, x2: torch.Tensor, attention: bool = False
+        self, x1: torch.Tensor, x2: torch.Tensor, attention: bool = False, context=None
     ) -> Dict[str, torch.Tensor]:
+
+        # contextが与えられている場合，必要に応じて初期化
+        if context is not None:
+            if "layers" not in context:
+                context["layers"] = []
+                for _ in range(self.num_layers):
+                    context["layers"].append({})
 
         self_attn_a = []
         self_attn_b = []
         cross_attn_a = []
         cross_attn_b = []
-        for layer in self.layers:
-            x1, x2, attn_list = layer(x1=x1, x2=x2)
+        for i, layer in enumerate(self.layers):
+            # contextが与えられている場合は利用して計算
+            c = context["layers"][i] if context is not None else None            
+            x1, x2, attn_list, c = layer(x1=x1, x2=x2, context=c)
+            
+            # contextが与えられている場合は更新
+            if context is not None:
+                context["layers"][i] = c
+            
             if attention:
                 # [sa1w, ca1w, sa2w, ca2w] = attn_list
                 self_attn_a.append(attn_list[0])
@@ -405,7 +495,8 @@ class GPTStereo(GPT):
             cross_attn_b = torch.stack(cross_attn_b, dim=1)  # stack on layer dim
             ret["self_attn"] = torch.stack([self_attn_a, self_attn_b], dim=1)
             ret["cross_attn"] = torch.stack([cross_attn_a, cross_attn_b], dim=1)
-        return ret
+        
+        return ret, context
 
 
 class Combinator(nn.Module):

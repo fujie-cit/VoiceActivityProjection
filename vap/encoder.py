@@ -46,7 +46,7 @@ class EncoderCPC(nn.Module):
             p.requires_grad_(True)
         print(f"Trainable {self.__class__.__name__}!")
 
-    def forward(self, waveform):
+    def forward(self, waveform, context=None):
         if waveform.ndim < 3:
             waveform = waveform.unsqueeze(1)  # channel dim
 
@@ -60,7 +60,34 @@ class EncoderCPC(nn.Module):
         # torch.autograd.set_detect_anomaly(True).
         # HOWEVER, if we feed through encoder.gAR we do not encounter that problem...
         z = self.encoder.gEncoder(waveform)
+
+        # streamingモードかどうかのチェック
+        is_streaming = context is not None
+
+        # streamingモードの場合は，真ん中の2つのフレームを抽出
+        if is_streaming:
+            length = z.shape[2]
+            z = z[:, :, length//2-1:length//2+1]
+                
         z = einops.rearrange(z, "b c n -> b n c")
-        z = self.encoder.gAR(z)
-        z = self.downsample(z)
-        return z
+
+        if is_streaming:
+            z, context["ar_hidden"] = self.encoder.gAR(z, context.get("ar_hidden", None))
+        else:
+            z, _ = self.encoder.gAR(z)
+
+        if is_streaming: 
+            if "ar_output" not in context:
+                b, n ,c = z.shape
+                context["ar_output"] = torch.zeros(b, 0, c, device=z.device)
+
+            new_ar_output = torch.cat((context["ar_output"], z), dim=1)
+            new_ar_output = new_ar_output[:, -5:, :] # TODO: 5 is hardcoded
+            context["ar_output"] = new_ar_output
+
+            z = new_ar_output
+            z = self.downsample(z)[:, -1:, :]
+        else:
+            z = self.downsample(z)
+
+        return z, context

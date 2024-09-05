@@ -166,13 +166,23 @@ class VapGPT(nn.Module):
     def horizon_time(self):
         return self.objective.horizon_time
 
-    def encode_audio(self, audio: torch.Tensor) -> Tuple[Tensor, Tensor]:
+    def encode_audio(self, audio: torch.Tensor, context=None) -> Tuple[Tensor, Tensor, dict]:
         assert (
             audio.shape[1] == 2
         ), f"audio VAP ENCODER: {audio.shape} != (B, 2, n_samples)"
-        x1 = self.encoder(audio[:, :1])  # speaker 1
-        x2 = self.encoder(audio[:, 1:])  # speaker 2
-        return x1, x2
+
+        # contextが与えられた場合は，必要に応じて初期化しエンコード処理に用いる
+        if context is not None:
+            if context == {}:
+                context["x1"] = {}
+                context["x2"] = {}
+            x1, context["x1"] = self.encoder(audio[:, :1], context=context["x1"]) # speaker 1
+            x2, context["x2"] = self.encoder(audio[:, 1:], context=context["x2"]) # speaker 2
+        else:
+            x1, _ = self.encoder(audio[:, :1])  # speaker 1
+            x2, _ = self.encoder(audio[:, 1:])  # speaker 2
+        
+        return x1, x2, context
 
     def vad_loss(self, vad_output, vad):
         return F.binary_cross_entropy_with_logits(vad_output, vad)
@@ -247,18 +257,135 @@ class VapGPT(nn.Module):
         return vad
 
     def forward(self, waveform: Tensor, attention: bool = False) -> Dict[str, Tensor]:
-        x1, x2 = self.encode_audio(waveform)
+        # # *** exp 1
+        # x1, x2, _ = self.encode_audio(waveform)
+        # x1とx2をファイルに保存する
+        # torch.save(x1, "exp/x1.pt") 
+        # torch.save(x2, "exp/x2.pt")
 
-        # Autoregressive
-        o1 = self.ar_channel(x1, attention=attention)  # ["x"]
-        o2 = self.ar_channel(x2, attention=attention)  # ["x"]
-        out = self.ar(o1["x"], o2["x"], attention=attention)
+        # # *** exp 2
+        # # waveformを単純に刻んで渡す
+        # # waveform's shape: (B, C, n_samples) C = 2
+        # chunk_size = 320
+        # n_samples = waveform.shape[-1]
+        # n_chunks = n_samples // chunk_size
+        # x1_chunks, x2_chunks = [], []
+        # self.encoder.encoder.gAR.keepHidden = True
+        # for i in range(n_chunks):
+        #     wavefrom_chunk = waveform[:, :, i*chunk_size:(i+1)*chunk_size]
+        #     x1_chunk, x2_chunk = self.encode_audio(wavefrom_chunk)
+        #     x1_chunks.append(x1_chunk)
+        #     x2_chunks.append(x2_chunk)
+        # x1 = torch.cat(x1_chunks, dim=1)
+        # x2 = torch.cat(x2_chunks, dim=1)
+        # torch.save(x1, "exp/x1_simple_320.pt")
+        # torch.save(x2, "exp/x2_simple_320.pt")
+
+        # # *** exp 3
+        # # waveformを刻んで渡す．cacheを使う
+        # chunk_size = 320
+        # cache = {}
+        # n_samples = waveform.shape[-1]
+        # n_chunks = n_samples // chunk_size
+        # x1_chunks, x2_chunks = [], []
+        # self.encoder.encoder.gAR.keepHidden = True
+        # for i in range(n_chunks):
+        #     wavefrom_chunk = waveform[:, :, i*chunk_size:(i+1)*chunk_size]
+        #     x1_chunk, x2_chunk, cache = self.encode_audio(wavefrom_chunk, cache)
+        #     x1_chunks.append(x1_chunk)
+        #     x2_chunks.append(x2_chunk)
+        # x1 = torch.cat(x1_chunks, dim=1)
+        # x2 = torch.cat(x2_chunks, dim=1)
+        # torch.save(x1, "exp/x1_cache_320.pt")
+        # torch.save(x2, "exp/x2_cache_320.pt")
+
+        # # *** exp 4
+        # # CPC Encoder の部分で，320サンプル→2フレーム出力をそのまま使っていたのを
+        # #                     640サンプル→4フレーム，先頭，末尾のフレームを削除して2フレーム，，とする
+        # chunk_size = 640
+        # hop_size = 320
+        # cache = {}
+        # n_samples = waveform.shape[-1]
+        # n_chunks = n_samples // hop_size
+        # x1_chunks, x2_chunks = [], []
+        # self.encoder.encoder.gAR.keepHidden = True
+        # # waveform = F.pad(waveform, (chunk_size//4, chunk_size//4))
+        # waveform = F.pad(waveform, (160, 160))
+        # for i in range(n_chunks):
+        #     wavefrom_chunk = waveform[:, :, i*hop_size:(i*hop_size+chunk_size)]
+        #     x1_chunk, x2_chunk, cache = self.encode_audio(wavefrom_chunk, cache)
+        #     x1_chunks.append(x1_chunk)
+        #     x2_chunks.append(x2_chunk)
+        # x1 = torch.cat(x1_chunks, dim=1)
+        # x2 = torch.cat(x2_chunks, dim=1)
+        # torch.save(x1, "exp/x1_cache_320_2.pt")
+        # torch.save(x2, "exp/x2_cache_320_2.pt")
+
+        # *** ストリーミングで1フレームずつ出力処理を行うコード
+        # encoder, transformer のコンテクスト
+        context = {
+            "encoder": {},
+            "ar_channel_1": {},
+            "ar_channel_2": {},
+            "ar": {},
+        }
+        chunk_size = 640 # 音声のチャンクサイズ
+        hop_size = 320   # 音声のホップサイズ（320 = 20msごと）
+        n_samples = waveform.shape[-1]   # 音声波形のサンプル数
+        n_chunks = n_samples // hop_size # チャンク数
+        waveform = F.pad(waveform, (160, 160)) # 辻褄合わせのために前後にパディング
+        outs = [] # 出力保存用のリスト
+        # 計算時間の計測のための準備
+        import time
+        t_start = time.time() # 処理開始時刻
+        t = t_start
+        # メインループ
+        for i in range(n_chunks):
+            # 音声をチャンクに分割
+            wavefrom_chunk = waveform[:, :, i*hop_size:(i*hop_size+chunk_size)]
+            # 音声をエンコード（x1, x2 には1つずつ出てくる）
+            x1, x2, context["encoder"] = self.encode_audio(wavefrom_chunk, context["encoder"])
+            # Transformerの計算．こちらも1フレームずつ出てくる
+            o1, context["ar_channel_1"] = self.ar_channel(x1, attention=attention, context=context["ar_channel_1"])  # ["x"]
+            o2, context["ar_channel_2"] = self.ar_channel(x2, attention=attention, context=context["ar_channel_2"])  # ["x"]
+            out, context["ar"] = self.ar(o1["x"], o2["x"], attention=attention, context=context["ar"])
+            outs.append(out)
+            # 時間の計測と表示
+            t_new = time.time()
+            print(f"chunk {i+1}/{n_chunks} took {t_new-t:.2f} sec")
+            t = t_new
+        # 全体の計算時間を表示
+        print(f"total took {t_new-t_start:.2f} sec")
+        # 出力の連結
+        out = {}
+        out["x"] = torch.cat([o["x"] for o in outs], dim=1)
+        out["x1"] = torch.cat([o["x1"] for o in outs], dim=1)
+        out["x2"] = torch.cat([o["x2"] for o in outs], dim=1)
+        # *** ストリーミング対応のコードはここまで ***
+
+        # # *** 元の通り動くコード ***
+        # x1, x2, _ = self.encode_audio(waveform)        
+        # # Autoregressive
+        # o1, _ = self.ar_channel(x1, attention=attention)  # ["x"]
+        # o2, _ = self.ar_channel(x2, attention=attention)  # ["x"]
+        # out, _ = self.ar(o1["x"], o2["x"], attention=attention)
+        # # *** 元通りのコードはここまで ***
 
         # Outputs
         v1 = self.va_classifier(out["x1"])
         v2 = self.va_classifier(out["x2"])
         vad = torch.cat((v1, v2), dim=-1)
         logits = self.vap_head(out["x"])
+
+        # # 出力を保存するコード（確認のため）
+        # # suffix = "" 
+        # # suffix = "_cache_320_2"
+        # suffix = "_cache_320_2_200"
+        # torch.save(out["x"], f"exp/out_x{suffix}.pt")
+        # torch.save(out["x1"], f"exp/out_x1{suffix}.pt")
+        # torch.save(out["x2"], f"exp/out_x2{suffix}.pt")
+        # torch.save(vad, f"exp/out_vad{suffix}.pt")
+        # torch.save(logits, f"exp/out_logits{suffix}.pt")      
 
         ret = {"logits": logits, "vad": vad}
         if attention:
