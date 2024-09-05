@@ -298,6 +298,42 @@ def plot_stereo(
         plt.pause(0.1)
     return fig, ax
 
+def plot_stereo_2(
+    waveform: torch.Tensor,
+    p_ns: torch.Tensor,
+    p_ns_2: torch.Tensor,
+    vad: torch.Tensor,
+    plot: bool = True,
+    figsize=(9, 6),
+):
+    assert (
+        waveform.ndim == 2
+    ), f"Expected waveform of shape (2, n_samples) got {waveform.shape}"
+
+    assert (
+        waveform.shape[0] == 2
+    ), f"Expected waveform of shape (2, n_samples) got {waveform.shape}"
+
+    assert vad.ndim == 2, f"Expected vad of shape (n_frames, 2) got {vad.shape}"
+    assert vad.shape[-1] == 2, f"Expected vad of shape (n_frames, 2) got {vad.shape}"
+
+    fig, ax = plt.subplots(5, 1, figsize=figsize)
+    _ = plot_waveform(waveform=waveform[0], ax=ax[0])
+    _ = plot_waveform(waveform=waveform[1], ax=ax[0], color="orange")
+    ax[0].set_xticks([])
+
+    plot_stereo_mel_spec(waveform, ax=[ax[1], ax[2]], vad=vad)
+    plot_next_speaker_probs(p_ns=p_ns, ax=ax[3])
+    ax[3].set_ylabel("Pnow", fontsize=12)
+    plot_next_speaker_probs(p_ns=p_ns_2, ax=ax[4])
+    ax[4].set_ylabel("Pfut", fontsize=12)
+    plt.subplots_adjust(
+        left=0.08, bottom=None, right=None, top=None, wspace=None, hspace=0.04
+    )
+    if plot:
+        plt.pause(0.1)
+    return fig, ax
+
 
 def plot_waveform(
     waveform,

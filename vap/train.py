@@ -18,7 +18,8 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 from torchmetrics.classification import Accuracy, F1Score
 
 # from datasets_turntaking import DialogAudioDM
-from vap_dataset.datamodule import VapDataModule
+# from vap_dataset.datamodule import VapDataModule
+from waseda_soma import VapDataModuleWasedaSoma
 from vap.phrases.dataset import PhrasesCallback
 from vap.callbacks import SymmetricSpeakersCallback, AudioAugmentationCallback
 from vap.events import TurnTakingEvents, EventConfig
@@ -66,15 +67,17 @@ class OptConfig:
 
 @dataclass
 class DataConfig:
-    train_path: str = "../vap_dataset/data/sliding_train.csv"
-    val_path: str = "../vap_dataset/data/sliding_val.csv"
-    test_path: str = "../vap_dataset/data/sliding_test.csv"
+    # train_path: str = "../vap_dataset/data/sliding_train.csv"
+    # val_path: str = "../vap_dataset/data/sliding_val.csv"
+    # test_path: str = "../vap_dataset/data/sliding_test.csv"
     flip_channels: bool = True
     flip_probability: float = 0.5
     mask_vad: bool = True
     mask_vad_probability: float = 0.5
-    batch_size: int = 16
-    num_workers: int = 24
+    # batch_size: int = 16
+    batch_size: int = 8
+    # num_workers: int = 24
+    num_workers: int = 8
 
     # not used for datamodule
     audio_duration: float = 20
@@ -158,10 +161,12 @@ def train() -> None:
     name = get_run_name(configs)
 
     dconf = configs["data"]
-    dm = VapDataModule(
-        train_path=dconf.train_path,
-        val_path=dconf.val_path,
-        horizon=2,
+    # dm = VapDataModule(
+    #    train_path=dconf.train_path,
+    #    val_path=dconf.val_path,
+    #    horizon=2,
+    dm = VapDataModuleWasedaSoma(
+        dataset_dir="/home/fujie/work/2023/VapDataWasedaSoma/dataset",
         batch_size=dconf.batch_size,
         num_workers=dconf.num_workers,
     )
@@ -257,6 +262,7 @@ class VAPModel(VapGPT, pl.LightningModule):
             self.zero_shot = ZeroShot(bin_times=conf.bin_times, frame_hz=conf.frame_hz)
             self.event_extractor = TurnTakingEvents(event_conf)
 
+
     def get_metrics(self):
         metrics = {"acc": {}, "f1": {}}
 
@@ -269,9 +275,9 @@ class VAPModel(VapGPT, pl.LightningModule):
         metrics["acc"]["sp"] = Accuracy(
             task="multiclass", num_classes=2, multiclass=True, average="none"
         ).to(self.device)
-        metrics["acc"]["bp"] = Accuracy(
-            task="multiclass", num_classes=2, multiclass=True, average="none"
-        ).to(self.device)
+        # metrics["acc"]["bp"] = Accuracy(
+        #     task="multiclass", num_classes=2, multiclass=True, average="none"
+        # ).to(self.device)
 
         metrics["f1"]["hs"] = F1Score(
             task="multiclass",
@@ -291,17 +297,19 @@ class VAPModel(VapGPT, pl.LightningModule):
             multiclass=True,
             average="weighted",
         ).to(self.device)
-        metrics["f1"]["bp"] = F1Score(
-            task="multiclass",
-            num_classes=2,
-            multiclass=True,
-            average="weighted",
-        ).to(self.device)
+        # metrics["f1"]["bp"] = F1Score(
+        #     task="multiclass",
+        #     num_classes=2,
+        #     multiclass=True,
+        #     average="weighted",
+        # ).to(self.device)
 
         return metrics
 
     def metrics_step(self, preds, targets, split="val"):
         m = self.val_metrics if split == "val" else self.test_metrics
+
+        # import ipdb; ipdb.set_trace()
 
         # The metrics don't work if the predictions are not rounded
         # I don't know why...
@@ -321,19 +329,21 @@ class VAPModel(VapGPT, pl.LightningModule):
                 preds=preds["pred_shift"].round(), target=targets["pred_shift"]
             )
 
-        if preds["pred_backchannel"] is not None:
-            m["f1"]["bp"].update(
-                preds=preds["pred_backchannel"], target=targets["pred_backchannel"]
-            )
-            m["acc"]["bp"].update(
-                preds=preds["pred_backchannel"], target=targets["pred_backchannel"]
-            )
+        # if preds["pred_backchannel"] is not None:
+        #     m["f1"]["bp"].update(
+        #         preds=preds["pred_backchannel"], target=targets["pred_backchannel"]
+        #     )
+        #     m["acc"]["bp"].update(
+        #         preds=preds["pred_backchannel"], target=targets["pred_backchannel"]
+        #     )
 
     def metrics_epoch(self, split="val"):
         if split == "val":
             m = self.val_metrics
         else:
             m = self.test_metrics
+
+        # import ipdb; ipdb.set_trace()
 
         f1 = {}
         for name, metric in m["f1"].items():
@@ -355,7 +365,7 @@ class VAPModel(VapGPT, pl.LightningModule):
         )
         self.log(f"{split}_pred_sh", {"shift": acc["sp"][1]}, sync_dist=True)
         self.log(f"{split}_ls", {"short": acc["ls"][1]}, sync_dist=True)
-        self.log(f"{split}_pred_bc", {"bc_pred": acc["bp"][1]}, sync_dist=True)
+        # self.log(f"{split}_pred_bc", {"bc_pred": acc["bp"][1]}, sync_dist=True)
 
     def shared_step(
         self, batch: Dict, reduction: str = "mean"

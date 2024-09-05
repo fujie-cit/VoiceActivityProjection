@@ -13,7 +13,7 @@ from vap.utils import (
     tensor_dict_to_json,
     write_json,
 )
-from vap.plot_utils import plot_stereo
+from vap.plot_utils import plot_stereo, plot_stereo_2
 
 
 everything_deterministic()
@@ -200,11 +200,15 @@ if __name__ == "__main__":
         sd = torch.load(args.state_dict)
         model.load_state_dict(sd)
     else:
-        from vap.train import VAPModel
+        from vap.train import VAPModel, OptConfig
 
         print("From Lightning checkpoint: ", args.checkpoint)
-        raise NotImplementedError("Not implemeted from checkpoint...")
+        # raise NotImplementedError("Not implemeted from checkpoint...")
         # model = VAPModel.load_from_checkpoint(args.checkpoint)
+        model = VapGPT(conf)
+        sd = torch.load(args.checkpoint, map_location="cpu")["state_dict"]
+        model.load_state_dict(sd, strict=False)
+        
     device = "cpu"
     if torch.cuda.is_available():
         model = model.to("cuda")
@@ -268,8 +272,9 @@ if __name__ == "__main__":
         print(out.keys())
         vad = out["vad"][0].cpu()
         p_ns = out["p_now"][0, :, 0].cpu()
-        fig, ax = plot_stereo(
-            waveform[0].cpu(), p_ns, vad, plot=False, figsize=(100, 6)
+        p_ns_2 = out["p_future"][0, :, 0].cpu()
+        fig, ax = plot_stereo_2(
+            waveform[0].cpu(), p_ns, p_ns_2, vad, plot=False, figsize=(100, 8)
         )
         # Save figure
         figpath = args.filename.replace(".json", ".png")
