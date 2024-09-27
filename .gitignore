@@ -139,4 +139,10 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# fujie
 runs/
+/*.png
+/*.json
+/my_example
+/exp
+/.vscode
