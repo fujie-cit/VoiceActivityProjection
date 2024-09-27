@@ -210,9 +210,9 @@ if __name__ == "__main__":
         model.load_state_dict(sd, strict=False)
         
     device = "cpu"
-    if torch.cuda.is_available():
-        model = model.to("cuda")
-        device = "cuda"
+    # if torch.cuda.is_available():
+    #     model = model.to("cuda")
+    #     device = "cuda"
     model = model.eval()
 
     ###########################################################
@@ -239,8 +239,8 @@ if __name__ == "__main__":
         # raise NotImplementedError("step extraction not implemented")
         out = step_extraction(waveform, model, device)
     else:
-        if torch.cuda.is_available():
-            waveform = waveform.to("cuda")
+        # if torch.cuda.is_available():
+        #     waveform = waveform.to("cuda")
         out = model.probs(waveform)
         out = batch_to_device(out, "cpu")  # to cpu for plot/save
 
